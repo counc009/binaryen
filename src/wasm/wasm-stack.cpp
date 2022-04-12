@@ -569,6 +569,12 @@ void BinaryInstWriter::visitSIMDTernary(SIMDTernary* curr) {
     case RelaxedFmsVecF64x2:
       o << U32LEB(BinaryConsts::F64x2RelaxedFms);
       break;
+    case DotI8x16I7x16AddSToVecI32x4:
+      o << U32LEB(BinaryConsts::I32x4DotI8x16I7x16AddS);
+      break;
+    case DotI8x16I7x16AddUToVecI32x4:
+      o << U32LEB(BinaryConsts::I32x4DotI8x16I7x16AddU);
+      break;
   }
 }
 
@@ -1666,7 +1672,7 @@ void BinaryInstWriter::visitBinary(Binary* curr) {
       break;
     case Q15MulrSatSVecI16x8:
       o << int8_t(BinaryConsts::SIMDPrefix)
-        << U32LEB(BinaryConsts::I16x8Q15mulrSatS);
+        << U32LEB(BinaryConsts::I16x8Q15MulrSatS);
       break;
     case ExtMulLowSVecI16x8:
       o << int8_t(BinaryConsts::SIMDPrefix)
@@ -1817,12 +1823,12 @@ void BinaryInstWriter::visitBinary(Binary* curr) {
         << U32LEB(BinaryConsts::I16x8NarrowI32x4U);
       break;
 
-    case SwizzleVec8x16:
+    case SwizzleVecI8x16:
       o << int8_t(BinaryConsts::SIMDPrefix)
         << U32LEB(BinaryConsts::I8x16Swizzle);
       break;
 
-    case RelaxedSwizzleVec8x16:
+    case RelaxedSwizzleVecI8x16:
       o << int8_t(BinaryConsts::SIMDPrefix)
         << U32LEB(BinaryConsts::I8x16RelaxedSwizzle);
       break;
@@ -1841,6 +1847,18 @@ void BinaryInstWriter::visitBinary(Binary* curr) {
     case RelaxedMaxVecF64x2:
       o << int8_t(BinaryConsts::SIMDPrefix)
         << U32LEB(BinaryConsts::F64x2RelaxedMax);
+      break;
+    case RelaxedQ15MulrSVecI16x8:
+      o << int8_t(BinaryConsts::SIMDPrefix)
+        << U32LEB(BinaryConsts::I16x8RelaxedQ15MulrS);
+      break;
+    case DotI8x16I7x16SToVecI16x8:
+      o << int8_t(BinaryConsts::SIMDPrefix)
+        << U32LEB(BinaryConsts::I16x8DotI8x16I7x16S);
+      break;
+    case DotI8x16I7x16UToVecI16x8:
+      o << int8_t(BinaryConsts::SIMDPrefix)
+        << U32LEB(BinaryConsts::I16x8DotI8x16I7x16U);
       break;
 
     case InvalidBinary:

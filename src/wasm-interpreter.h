@@ -917,6 +917,7 @@ public:
       case AvgrUVecI16x8:
         return left.avgrUI16x8(right);
       case Q15MulrSatSVecI16x8:
+      case RelaxedQ15MulrSVecI16x8:
         return left.q15MulrSatSI16x8(right);
       case ExtMulLowSVecI16x8:
         return left.extMulLowSI16x8(right);
@@ -1011,9 +1012,14 @@ public:
       case NarrowUVecI32x4ToVecI16x8:
         return left.narrowUToI16x8(right);
 
-      case SwizzleVec8x16:
-      case RelaxedSwizzleVec8x16:
+      case SwizzleVecI8x16:
+      case RelaxedSwizzleVecI8x16:
         return left.swizzleI8x16(right);
+
+      case DotI8x16I7x16SToVecI16x8:
+        return left.dotSI8x16toI16x8(right);
+      case DotI8x16I7x16UToVecI16x8:
+        return left.dotUI8x16toI16x8(right);
 
       case InvalidBinary:
         WASM_UNREACHABLE("invalid binary op");
@@ -1123,7 +1129,7 @@ public:
       case RelaxedFmsVecF64x2:
         return a.relaxedFmsF64x2(b, c);
       default:
-        // TODO: implement signselect
+        // TODO: implement signselect and dot_add
         WASM_UNREACHABLE("not implemented");
     }
   }

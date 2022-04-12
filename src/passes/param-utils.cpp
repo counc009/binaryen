@@ -62,13 +62,22 @@ bool removeParameter(const std::vector<Function*>& funcs,
   // Check if none of the calls has a param with side effects that we cannot
   // remove (as if we can remove them, we will simply do that when we remove the
   // parameter). Note: flattening the IR beforehand can help here.
+  auto hasBadEffects = [&](ExpressionList& operands) {
+    return EffectAnalyzer(runner->options, *module, operands[index])
+      .hasUnremovableSideEffects();
+  };
   bool callParamsAreValid =
     std::none_of(calls.begin(), calls.end(), [&](Call* call) {
-      auto* operand = call->operands[index];
-      return EffectAnalyzer(runner->options, *module, operand)
-        .hasUnremovableSideEffects();
+      return hasBadEffects(call->operands);
     });
   if (!callParamsAreValid) {
+    return false;
+  }
+  bool callRefParamsAreValid =
+    std::none_of(callRefs.begin(), callRefs.end(), [&](CallRef* call) {
+      return hasBadEffects(call->operands);
+    });
+  if (!callRefParamsAreValid) {
     return false;
   }
 
@@ -191,25 +200,14 @@ SortedVector applyConstantValues(const std::vector<Function*>& funcs,
   auto numParams = first->getNumParams();
   for (Index i = 0; i < numParams; i++) {
     PossibleConstantValues value;
-
-    // Processes one operand.
-    auto processOperand = [&](Expression* operand) {
-      if (auto* c = operand->dynCast<Const>()) {
-        value.note(c->value);
-        return;
-      }
-      // TODO: refnull, immutable globals, etc.
-      // Not a constant, give up
-      value.noteUnknown();
-    };
     for (auto* call : calls) {
-      processOperand(call->operands[i]);
+      value.note(call->operands[i], *module);
       if (!value.isConstant()) {
         break;
       }
     }
     for (auto* call : callRefs) {
-      processOperand(call->operands[i]);
+      value.note(call->operands[i], *module);
       if (!value.isConstant()) {
         break;
       }
@@ -223,8 +221,7 @@ SortedVector applyConstantValues(const std::vector<Function*>& funcs,
     Builder builder(*module);
     for (auto* func : funcs) {
       func->body = builder.makeSequence(
-        builder.makeLocalSet(i, builder.makeConst(value.getConstantLiteral())),
-        func->body);
+        builder.makeLocalSet(i, value.makeExpression(*module)), func->body);
     }
     optimized.insert(i);
   }

@@ -1633,8 +1633,11 @@ void FunctionValidator::visitBinary(Binary* curr) {
     case NarrowUVecI16x8ToVecI8x16:
     case NarrowSVecI32x4ToVecI16x8:
     case NarrowUVecI32x4ToVecI16x8:
-    case SwizzleVec8x16:
-    case RelaxedSwizzleVec8x16: {
+    case SwizzleVecI8x16:
+    case RelaxedSwizzleVecI8x16:
+    case RelaxedQ15MulrSVecI16x8:
+    case DotI8x16I7x16SToVecI16x8:
+    case DotI8x16I7x16UToVecI16x8: {
       shouldBeEqualOrFirstIsUnreachable(
         curr->left->type, Type(Type::v128), curr, "v128 op");
       shouldBeEqualOrFirstIsUnreachable(
@@ -2728,11 +2731,11 @@ void FunctionValidator::visitFunction(Function* curr) {
     shouldBeTrue(result.isConcrete(), curr, "results must be concretely typed");
   }
   for (const auto& var : curr->vars) {
-    if (var.isRef() && getModule()->features.hasGCNNLocals()) {
-      continue;
-    }
     features |= var.getFeatures();
-    shouldBeTrue(var.isDefaultable(), var, "vars must be defaultable");
+    bool valid = getModule()->features.hasGCNNLocals()
+                   ? var.isDefaultableOrNonNullable()
+                   : var.isDefaultable();
+    shouldBeTrue(valid, var, "vars must be defaultable");
   }
   shouldBeTrue(features <= getModule()->features,
                curr->name,

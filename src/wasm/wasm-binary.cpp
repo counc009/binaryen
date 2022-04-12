@@ -2656,24 +2656,25 @@ void WasmBinaryBuilder::pushExpression(Expression* curr) {
     // Store tuple to local and push individual extracted values
     Builder builder(wasm);
     // Non-nullable types require special handling as they cannot be stored to
-    // a local.
-    std::vector<Type> finalTypes;
+    // a local, so we may need to use a different local type than the original.
+    auto localType = type;
     if (!wasm.features.hasGCNNLocals()) {
+      std::vector<Type> finalTypes;
       for (auto t : type) {
         if (t.isNonNullable()) {
           t = Type(t.getHeapType(), Nullable);
         }
         finalTypes.push_back(t);
       }
+      localType = Type(Tuple(finalTypes));
     }
-    auto nullableType = Type(Tuple(finalTypes));
     requireFunctionContext("pushExpression-tuple");
-    Index tuple = builder.addVar(currFunction, nullableType);
+    Index tuple = builder.addVar(currFunction, localType);
     expressionStack.push_back(builder.makeLocalSet(tuple, curr));
-    for (Index i = 0; i < nullableType.size(); ++i) {
+    for (Index i = 0; i < localType.size(); ++i) {
       Expression* value =
-        builder.makeTupleExtract(builder.makeLocalGet(tuple, nullableType), i);
-      if (nullableType[i] != type[i]) {
+        builder.makeTupleExtract(builder.makeLocalGet(tuple, localType), i);
+      if (localType[i] != type[i]) {
         // We modified this to be nullable; undo that.
         value = builder.makeRefAs(RefAsNonNull, value);
       }
@@ -5396,7 +5397,7 @@ bool WasmBinaryBuilder::maybeVisitSIMDBinary(Expression*& out, uint32_t code) {
       curr = allocator.alloc<Binary>();
       curr->op = AvgrUVecI16x8;
       break;
-    case BinaryConsts::I16x8Q15mulrSatS:
+    case BinaryConsts::I16x8Q15MulrSatS:
       curr = allocator.alloc<Binary>();
       curr->op = Q15MulrSatSVecI16x8;
       break;
@@ -5574,11 +5575,11 @@ bool WasmBinaryBuilder::maybeVisitSIMDBinary(Expression*& out, uint32_t code) {
       break;
     case BinaryConsts::I8x16Swizzle:
       curr = allocator.alloc<Binary>();
-      curr->op = SwizzleVec8x16;
+      curr->op = SwizzleVecI8x16;
       break;
     case BinaryConsts::I8x16RelaxedSwizzle:
       curr = allocator.alloc<Binary>();
-      curr->op = RelaxedSwizzleVec8x16;
+      curr->op = RelaxedSwizzleVecI8x16;
       break;
     case BinaryConsts::F32x4RelaxedMin:
       curr = allocator.alloc<Binary>();
@@ -5595,6 +5596,18 @@ bool WasmBinaryBuilder::maybeVisitSIMDBinary(Expression*& out, uint32_t code) {
     case BinaryConsts::F64x2RelaxedMax:
       curr = allocator.alloc<Binary>();
       curr->op = RelaxedMaxVecF64x2;
+      break;
+    case BinaryConsts::I16x8RelaxedQ15MulrS:
+      curr = allocator.alloc<Binary>();
+      curr->op = RelaxedQ15MulrSVecI16x8;
+      break;
+    case BinaryConsts::I16x8DotI8x16I7x16S:
+      curr = allocator.alloc<Binary>();
+      curr->op = DotI8x16I7x16SToVecI16x8;
+      break;
+    case BinaryConsts::I16x8DotI8x16I7x16U:
+      curr = allocator.alloc<Binary>();
+      curr->op = DotI8x16I7x16UToVecI16x8;
       break;
     default:
       return false;
@@ -6069,6 +6082,14 @@ bool WasmBinaryBuilder::maybeVisitSIMDTernary(Expression*& out, uint32_t code) {
     case BinaryConsts::F64x2RelaxedFms:
       curr = allocator.alloc<SIMDTernary>();
       curr->op = RelaxedFmsVecF64x2;
+      break;
+    case BinaryConsts::I32x4DotI8x16I7x16AddS:
+      curr = allocator.alloc<SIMDTernary>();
+      curr->op = DotI8x16I7x16AddSToVecI32x4;
+      break;
+    case BinaryConsts::I32x4DotI8x16I7x16AddU:
+      curr = allocator.alloc<SIMDTernary>();
+      curr->op = DotI8x16I7x16AddUToVecI32x4;
       break;
     default:
       return false;
