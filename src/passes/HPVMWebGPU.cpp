@@ -770,7 +770,53 @@ static bool emitCode(Expression* expr, std::string& output,
       }
       break;
     }
+    EXPR_CASE(SelectId) {
+      Select* selectExp = static_cast<Select*>(expr);
 
+      std::string condName, trueName, falseName;
+      InferType condType, trueType, falseType;
+      if (!emitCode(selectExp->condition, output, types, &condName, &condType))
+        return false;
+      if (!emitCode(selectExp->ifTrue, output, types, &trueName, &trueType))
+        return false;
+      if (!emitCode(selectExp->ifFalse, output, types, &falseName, &falseType))
+        return false;
+
+      if (condName == ""  || condType == InferType::noType
+         || trueName == ""  || trueType == InferType::noType
+         || falseName == "" || falseType == InferType::noType) {
+        std::cerr << "Select expression's operands did not all produce values ("
+                     __FILE__ " : " << __LINE__ << ")\n";
+        selectExp->dump();
+        return false;
+      }
+
+      InferType opType = InferType::noType;
+      if (typeForEquality(trueType) == typeForEquality(falseType))
+        opType = trueType;
+      else if (trueType == InferType::n32 || trueType == InferType::n64)
+        opType = falseType;
+      else if (falseType == InferType::n32 || falseType == InferType::n64)
+        opType = trueType;
+      else {
+        std::cerr << "Type mismatch in select (" __FILE__ " : "
+                  << __LINE__ << ")\n";
+        std::cerr << "True value " << typeToWebGPU(trueType) << ", False Value "
+                  << typeToWebGPU(falseType) << "\n";
+        return false;
+      }
+      
+      std::string joinName = "tmp" + std::to_string(uniq());
+      output += "var " + joinName + " : " + typeToWebGPU(opType) + ";";
+      output += "if (bool(" + condName + ")) {\n" 
+              + joinName + " = " + trueName + ";\n"
+                "} else {\n"
+              + joinName + " = " + falseName + ";\n"
+                "}\n";
+      if (valName) *valName = joinName;
+      if (resType) *resType = opType;
+      break;
+    }
     default:
       std::cerr << "Encountered unhandled expression (" __FILE__ " : "
                 << __LINE__ << "): " << expr->_id << "\n"; expr->dump();
