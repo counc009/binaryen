@@ -426,6 +426,8 @@ void PassRegistry::registerPasses() {
   registerTestPass("catch-pop-fixup",
                    "fixup nested pops within catches",
                    createCatchPopFixupPass);
+
+  registerPass("hpvm-webgpu", "compiles a WASM module to a WebGPU kernel", createHPVMWebGPUPass);
 }
 
 void PassRunner::addIfNoDWARFIssues(std::string passName) {

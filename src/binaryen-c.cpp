@@ -4006,6 +4006,8 @@ void BinaryenModuleRunPasses(BinaryenModuleRef module,
     passRunner.add(passes[i]);
   }
   passRunner.run();
+  // Added this to allow us to communicate back to the JavaScript layer
+  globalPassOptions = passRunner.options;
 }
 
 void BinaryenModuleAutoDrop(BinaryenModuleRef module) {

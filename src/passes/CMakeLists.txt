@@ -98,6 +98,7 @@ set(passes_SOURCES
   SSAify.cpp
   Untee.cpp
   Vacuum.cpp
+  HPVMWebGPU.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/WasmIntrinsics.cpp
   ${passes_HEADERS}
 )

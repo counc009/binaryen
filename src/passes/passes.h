@@ -139,6 +139,9 @@ Pass* createVacuumPass();
 // Test passes:
 Pass* createCatchPopFixupPass();
 
+// HPVM passes:
+Pass* createHPVMWebGPUPass();
+
 } // namespace wasm
 
 #endif
