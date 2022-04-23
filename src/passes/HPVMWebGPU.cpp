@@ -58,7 +58,7 @@ static bool extractTypes(std::string const& str, std::vector<PassedType>& out) {
 }
 
 enum InferType : int32_t {
-  i32, u32, i64, u64, f32, f64,
+  i32, u32, i64, u64, f32, f64, bool_,
   i32_ptr, u32_ptr, i64_ptr, u64_ptr, f32_ptr, f64_ptr,
   x_idx, y_idx, z_idx, x_dim, y_dim, z_dim,
   n32, n64, /* types for integers that we know the size of, but not sign */
@@ -72,6 +72,10 @@ static bool isArray(InferType ty) {
       return true;
     default: return false;
   }
+}
+
+static bool isFloatType(InferType ty) {
+  return ty == InferType::f32 || ty == InferType::f64;
 }
 
 static InferType getElemType(InferType ty) {
@@ -107,18 +111,19 @@ static InferType typeForEquality(InferType ty) {
 
 static std::string typeToWebGPU(InferType ty) {
   switch (ty) {
+    case InferType::bool_: return "bool";
     case InferType::i32: return "i32";
     case InferType::u32: return "u32";
     case InferType::i64: return "i64";
     case InferType::u64: return "u64";
     case InferType::f32: return "f32";
-    case InferType::f64: return "f64";
+    case InferType::f64: return "f32"; // FIXME: Apparently Firefox doesn't support f64 yet
     case InferType::i32_ptr: return "array<i32>";
     case InferType::u32_ptr: return "array<u32>";
     case InferType::i64_ptr: return "array<i64>";
     case InferType::u64_ptr: return "array<u64>";
     case InferType::f32_ptr: return "array<f32>";
-    case InferType::f64_ptr: return "array<f64>";
+    case InferType::f64_ptr: { std::cerr << "Firefox doesn't currently support f64"; exit(1); } //return "array<f64>";
     case InferType::x_idx: return "u32";
     case InferType::y_idx: return "u32";
     case InferType::z_idx: return "u32";
@@ -262,6 +267,11 @@ static bool onlyIfCF(Expression* expr) {
     EXPR_CASE(BinaryId) {
       Binary* binaryExp = static_cast<Binary*>(expr);
       return onlyIfCF(binaryExp->left) && onlyIfCF(binaryExp->right);
+    }
+    EXPR_CASE(SelectId) {
+      Select* selectExp = static_cast<Select*>(expr);
+      return onlyIfCF(selectExp->condition) && onlyIfCF(selectExp->ifTrue)
+          && onlyIfCF(selectExp->ifFalse);
     }
     default: {
       std::cerr << "Encountered unhandled expression (" __FILE__ " : "
@@ -464,63 +474,135 @@ static bool emitCode(Expression* expr, std::string& output,
                      std::string* valName=nullptr,
                      InferType* resType=nullptr);
 
-static bool emitArray(Expression* expr, std::string& output,
-                      std::vector<InferType>& types,
-                      std::string& idxName, std::string& arrayName,
-                      InferType& elemType) {
+
+// Converts an array access into a form such that the top-level is always an
+// add, with the left being the array and the right being the index. Returns
+// null if it fails to do this
+// Also takes a vector to track memory allocations that should be freed when
+// the produced expressions are no longer needed
+static Binary* normalizeArray(Expression* expr, 
+                              std::vector<InferType>& types,
+                              std::vector<Expression*>& freeWhenDone,
+                              bool topLevel=true) {
+  if (expr->_id == Expression::Id::LocalGetId) {
+    Index access = static_cast<LocalGet*>(expr)->index;
+    if (isArray(types[access])) {
+      Const* constZero = new Const;
+      constZero->value = Literal((int32_t)0);
+
+      Binary* result = new Binary;
+      result->op = BinaryOp::AddInt32;
+      result->left = expr;
+      result->right = constZero;
+
+      freeWhenDone.push_back(constZero); freeWhenDone.push_back(result);
+      return result;
+    } else {
+      if (topLevel) {
+        std::cerr << "Array expression based on local-get of non-array value:\n";
+        expr->dump();
+      }
+      return nullptr;
+    }
+  }
+
   if (expr->_id != Expression::Id::BinaryId) {
-    std::cerr << "Failed to analyze array access, top level is not a binary "
-                  "operation:\n";
-    expr->dump();
-    return false;
+    if (topLevel) {
+      std::cerr << "Failed to analyze array access, top level is not a binary "
+                   "or local-get operation:\n";
+      expr->dump();
+    }
+    return nullptr;
   }
 
   Binary* binaryExp = static_cast<Binary*>(expr);
   if (binaryExp->op != BinaryOp::AddInt32) {
-    std::cerr << "Failed to analyze array access, top level is not an add:\n";
-    expr->dump();
-    return false;
+    if (topLevel) {
+      std::cerr << "Failed to analyze array access, top level is not an add:\n";
+      expr->dump();
+    }
+    return nullptr;
   }
 
-  Expression* left = binaryExp->left;
+  Expression* left  = binaryExp->left;
   Expression* right = binaryExp->right;
 
-  bool leftArray = false, rightArray = false; Index arrayIndex;
-  InferType arrayElemType;
-  if (left->_id == Expression::Id::LocalGetId) {
-    Index access = static_cast<LocalGet*>(left)->index;
-    if (isArray(types[access])) {
-      leftArray = true;
-      arrayIndex = access;
-      arrayElemType = getElemType(types[access]);
+  Binary* normalizeLeft = normalizeArray(left, types, freeWhenDone, false);
+  Binary* normalizeRight = normalizeArray(right, types, freeWhenDone, false);
+
+  if (normalizeLeft == nullptr && normalizeRight == nullptr) {
+    if (topLevel) {
+      std::cerr << "Failed to analyze array access, could not find an array:\n";
+      expr->dump();
     }
-  }
-  if (right->_id == Expression::Id::LocalGetId) {
-    Index access = static_cast<LocalGet*>(right)->index;
-    if (isArray(types[access])) {
-      rightArray = true;
-      arrayIndex = access;
-      arrayElemType = getElemType(types[access]);
-    }
-  }
-  if (!leftArray && !rightArray) {
-    std::cerr << "Failed to analyze array access, neither operands of top "
-                 "level add is an array:\n";
+    return nullptr;
+  } else if (normalizeLeft != nullptr && normalizeRight != nullptr) {
+    std::cerr << "Failed to analyze array access, found multiple arrays:\n";
     expr->dump();
-    return false;
-  } else if (leftArray && rightArray) {
-    std::cerr << "Failed to analyze array access, both operands of top level "
-                 "add are arrays:\n";
-    expr->dump();
-    return false;
+    return nullptr;
+  } else if (normalizeLeft != nullptr) {
+    // So, normalizeLeft is now Add(array, idx)
+    // So, expr can be treated as Add(Add(array, idx), right)
+    // Which, is equivalent to Add(array, Add(idx, right))
+    assert(normalizeLeft->op == BinaryOp::AddInt32 &&
+           "Normalized array access is constructed to be an add");
+    Binary* result = new Binary;
+    result->op = BinaryOp::AddInt32;
+    result->left = normalizeLeft->left;
+    result->right = normalizeLeft;
+    normalizeLeft->left = normalizeLeft->right;
+    normalizeLeft->right = right;
+
+    freeWhenDone.push_back(result);
+    return result;
+  } else if (normalizeRight != nullptr) {
+    // So, normalizeRight is Add(array, idx)
+    // So, expr is Add(left, Add(array, idx))
+    // Equivalently, Add(array, Add(left, idx))
+    assert(normalizeRight->op == BinaryOp::AddInt32 &&
+           "Normalized array access is constructed to be an add");
+    Binary* result = new Binary;
+    result->op = BinaryOp::AddInt32;
+    result->left = normalizeRight->left;
+    result->right = normalizeRight;
+    normalizeRight->left = left;
+
+    freeWhenDone.push_back(result);
+    return result;
+  } else {
+    assert(false && "Unreachable");
   }
+}
+
+static bool emitArray(Expression* expr, std::string& output,
+                      std::vector<InferType>& types,
+                      std::string& idxName, std::string& arrayName,
+                      InferType& elemType) {
+  
+  std::vector<Expression*> freeWhenDone;
+  Binary* normalized = normalizeArray(expr, types, freeWhenDone);
+
+  if (!normalized) { return false; }
+
+  assert(normalized->op == BinaryOp::AddInt32
+         && "normalizedArray() should only produce an add");
+
+  Expression* array = normalized->left;
+  Expression* index = normalized->right;
+
+  assert(array->_id == Expression::Id::LocalGetId
+         && "normalizedArray() should only produce local-get for array");
+  Index arrayIndex = static_cast<LocalGet*>(array)->index;
+  assert(isArray(types[arrayIndex])
+         && "normalizedArray() produces array of non-array type");
+  InferType arrayElemType = getElemType(types[arrayIndex]);
 
   std::string indexName; InferType indexType;
-  if (!emitCode(leftArray ? right : left, output, types, &indexName, &indexType))
+  if (!emitCode(index, output, types, &indexName, &indexType))
     return false;
   if (indexType == InferType::noType || indexName == "") {
     std::cerr << "Index expression did not produce a value:\n";
-    (leftArray ? right : left)->dump();
+    index->dump();
     return false;
   }
 
@@ -532,23 +614,35 @@ static bool emitArray(Expression* expr, std::string& output,
   arrayName = "arg" + std::to_string(arrayIndex);
   idxName = idx;
   elemType = arrayElemType;
+
+  for (Expression* ptr : freeWhenDone) delete ptr;
   return true;
 }
 
-#define GEN_BINARY_OP(OpName, Operator)                                        \
+#define GEN_BINARY_OP(OpName, Operator, Type)                                  \
   case BinaryOp::OpName: {                                                     \
-    output += "let " + tmp + " = " + typeToWebGPU(opType)                      \
-            + "(" + leftName + ") " Operator " " + typeToWebGPU(opType)        \
-            + "(" + rightName + ");\n";                                        \
+    output += "let " + tmp + " : " + typeToWebGPU(Type) + " = "                \
+            + typeToWebGPU(opType) + "(" + leftName + ") " Operator " "        \
+            + typeToWebGPU(opType) + "(" + rightName + ");\n";                 \
     if (valName) *valName = tmp;                                               \
-    if (resType) *resType = opType;                                            \
+    if (resType) *resType = Type;                                              \
     break;                                                                     \
   }
-#define GEN_BINARY_OP_ALL_TYPES(OpName, Operator)                              \
-  GEN_BINARY_OP(OpName##Int32, Operator)                                       \
-  GEN_BINARY_OP(OpName##Int64, Operator)                                       \
-  GEN_BINARY_OP(OpName##Float32, Operator)                                     \
-  GEN_BINARY_OP(OpName##Float64, Operator)
+#define GEN_BINARY_OP_ALL_INT_TYPES(OpName, Operator, Type)                    \
+  GEN_BINARY_OP(OpName##Int32, Operator, Type)                                 \
+  GEN_BINARY_OP(OpName##Int64, Operator, Type)
+#define GEN_BINARY_OP_ALL_INT_TYPES_SIGNED(OpName, Operator, Type)             \
+  GEN_BINARY_OP_ALL_INT_TYPES(OpName##S, Operator, Type)                       \
+  GEN_BINARY_OP_ALL_INT_TYPES(OpName##U, Operator, Type)
+#define GEN_BINARY_OP_ALL_FLOAT_TYPES(OpName, Operator, Type)                  \
+  GEN_BINARY_OP(OpName##Float32, Operator, Type)                               \
+  GEN_BINARY_OP(OpName##Float64, Operator, Type)
+#define GEN_BINARY_OP_ALL_TYPES(OpName, Operator, Type)                        \
+  GEN_BINARY_OP_ALL_INT_TYPES(OpName, Operator, Type)                          \
+  GEN_BINARY_OP_ALL_FLOAT_TYPES(OpName, Operator, Type)
+#define GEN_BINARY_OP_ALL_TYPES_SIGNED(OpName, Operator, Type)                 \
+  GEN_BINARY_OP_ALL_INT_TYPES_SIGNED(OpName, Operator, Type)                   \
+  GEN_BINARY_OP_ALL_FLOAT_TYPES(OpName, Operator, Type)
 
 static bool emitCode(Expression* expr, std::string& output,
                      std::vector<InferType>& types,
@@ -636,11 +730,25 @@ static bool emitCode(Expression* expr, std::string& output,
         return false;
       }
 
-      if (typeToWebGPU(valueType) != typeToWebGPU(elemType))
-        output += arrayName + ".value[" + idxName + "] = "
-                + typeToWebGPU(elemType) + "(" + valueName + ");\n";
-      else
-        output += arrayName + ".value[" + idxName + "] = " + valueName + ";\n";
+      // FIXME: Right-now this is a special-case because compiles sometimes
+      // like storing ints into floats, and for WebGPU we have to use a bitcast
+      // to achieve this; we should have a better test for whether to cast or
+      // bitcast
+      if (storeExp->valueType.isInteger() && isFloatType(elemType)) {
+        output += arrayName + ".value[" + idxName + "] = bitcast<"
+                + typeToWebGPU(elemType) + ">(" + valueName + ");\n";
+      } else if (storeExp->valueType.isFloat() && !isFloatType(elemType)) {
+        std::cerr << "Storing a float into an integer type not supported ("
+                     __FILE__ " : " << __LINE__ << ")\n";
+        return false;
+      } else {
+        if (typeToWebGPU(valueType) != typeToWebGPU(elemType))
+          output += arrayName + ".value[" + idxName + "] = "
+                  + typeToWebGPU(elemType) + "(" + valueName + ");\n";
+        else
+          output += arrayName + ".value[" + idxName + "] = " + valueName
+                  + ";\n";
+      }
       break;
     }
 
@@ -675,8 +783,8 @@ static bool emitCode(Expression* expr, std::string& output,
           break;
         }
         case Type::BasicType::f64: {
-          output += "let " + tmp + " : f64 = "
-                  + std::to_string(value.getf64()) + ";\n";
+          output += "let " + tmp + " : f32 = f32(" // FIXME: Apparently Firefox doesn't support f64 yet
+                  + std::to_string(value.getf64()) + ");\n";
           if (valName) *valName = tmp;
           if (resType) *resType = InferType::f64;
           break;
@@ -704,6 +812,27 @@ static bool emitCode(Expression* expr, std::string& output,
 
       //std::string tmp = "tmp" + std::to_string(uniq());
       switch (unaryExp->op) {
+        case UnaryOp::ConvertUInt32ToFloat32: {
+          std::string resName = "tmp" + std::to_string(uniq());
+          output += "let " + resName + " : f32 = f32(" + valueName + ");\n";
+          if (valName) *valName = resName;
+          if (resType) *resType = InferType::f32;
+          break;
+        }
+        case UnaryOp::ConvertUInt32ToFloat64: {
+          std::string resName = "tmp" + std::to_string(uniq());
+          output += "let " + resName + " : f32 = f32(" + valueName + ");\n"; // FIXME (f64)
+          if (valName) *valName = resName;
+          if (resType) *resType = InferType::f64;
+          break;
+        }
+        case UnaryOp::DemoteFloat64: {
+          std::string resName = "tmp" + std::to_string(uniq());
+          output += "let " + resName + " : f32 = f32(" + valueName + ");\n"; // FIXME (f64)
+          if (valName) *valName = resName;
+          if (resType) *resType = InferType::f32;
+          break;
+        }
         default:
           std::cerr << "Unsupported unary operation encountered (" __FILE__
                        " : " << __LINE__ << "):\n";
@@ -741,23 +870,33 @@ static bool emitCode(Expression* expr, std::string& output,
                   << __LINE__ << ")\n";
         std::cerr << "Left " << typeToWebGPU(leftType) << ", Right "
                   << typeToWebGPU(rightType) << "\n";
+        binaryExp->dump();
         return false;
       }
 
       std::string tmp = "tmp" + std::to_string(uniq());
       switch (binaryExp->op) {
-        GEN_BINARY_OP_ALL_TYPES(Add, "+")
-        GEN_BINARY_OP_ALL_TYPES(Sub, "-")
-        GEN_BINARY_OP_ALL_TYPES(Mul, "*")
-        GEN_BINARY_OP_ALL_TYPES(Eq, "==")
-        GEN_BINARY_OP_ALL_TYPES(Ne, "!=")
+        GEN_BINARY_OP_ALL_TYPES(Add, "+", opType)
+        GEN_BINARY_OP_ALL_TYPES(Sub, "-", opType)
+        GEN_BINARY_OP_ALL_TYPES(Mul, "*", opType)
+        GEN_BINARY_OP_ALL_TYPES(Eq, "==", InferType::bool_)
+        GEN_BINARY_OP_ALL_TYPES(Ne, "!=", InferType::bool_)
+        GEN_BINARY_OP_ALL_TYPES_SIGNED(Lt, "<", InferType::bool_)
+        GEN_BINARY_OP_ALL_TYPES_SIGNED(Le, "<=", InferType::bool_)
+        GEN_BINARY_OP_ALL_TYPES_SIGNED(Gt, ">", InferType::bool_)
+        GEN_BINARY_OP_ALL_TYPES_SIGNED(Ge, ">=", InferType::bool_)
+        GEN_BINARY_OP_ALL_TYPES_SIGNED(Div, "/", opType)
+        GEN_BINARY_OP_ALL_INT_TYPES_SIGNED(Rem, "%", opType)
+        GEN_BINARY_OP_ALL_INT_TYPES(And, "&", opType)
+        GEN_BINARY_OP_ALL_INT_TYPES(Or, "|", opType)
+        GEN_BINARY_OP_ALL_INT_TYPES(Xor, "^", opType)
         case BinaryOp::ShlInt32: case BinaryOp::ShlInt64: {
           // NOTE: The WebGPU WGSL standard says shifts are performed using a
           // shiftLeft(x, y) operator, but Firefox seems to not support this
           // and instead supports x << y
           output += "let " + tmp + " = "
                   + typeToWebGPU(opType) + "(" + leftName + ") << "
-                  + typeToWebGPU(opType) + "(" + rightName + ");\n";
+                  + "u32(" + rightName + ");\n";
           if (valName) *valName = tmp;
           if (resType) *resType = opType;
           break;
@@ -807,12 +946,12 @@ static bool emitCode(Expression* expr, std::string& output,
       }
       
       std::string joinName = "tmp" + std::to_string(uniq());
-      output += "var " + joinName + " : " + typeToWebGPU(opType) + ";";
+      output += "var " + joinName + " : " + typeToWebGPU(opType) + ";\n";
       output += "if (bool(" + condName + ")) {\n" 
-              + joinName + " = " + trueName + ";\n"
-                "} else {\n"
-              + joinName + " = " + falseName + ";\n"
-                "}\n";
+              + joinName + " = " + typeToWebGPU(opType) + "(" + trueName
+              + ");\n} else {\n"
+              + joinName + " = " + typeToWebGPU(opType) + " (" + falseName
+              + ");\n}\n";
       if (valName) *valName = joinName;
       if (resType) *resType = opType;
       break;
