@@ -1418,7 +1418,7 @@ static bool translateFunction(
 
     const Type::BasicType bTy = param.getBasic();
     switch (bTy) {
-      CASE_TYPE(i32, PROVIDED(i32) PROVIDED(u32) PROVIDED(i32_ptr)
+      CASE_TYPE(i32, PROVIDED(i32) PROVIDED(u32) PROVIDED_PTR(i32)
                      PROVIDED_PTR(u32) PROVIDED_PTR(i64) PROVIDED_PTR(u64)
                      PROVIDED_PTR(f32) PROVIDED_PTR(f64)
                      PROVIDED_IDX(x) PROVIDED_IDX(y) PROVIDED_IDX(z)
