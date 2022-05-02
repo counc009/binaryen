@@ -8,6 +8,7 @@
 #include "wasm.h"
 #include "wasm-builder.h"
 
+#include <list>
 #include <map>
 #include <stack>
 #include <string>
@@ -286,6 +287,11 @@ static bool onlyIfCF(Expression* expr) {
 static CFGNode* constructCFG(Expression* expr, CFGNode* curNode,
                              std::map<Name, CFGNode*>& branches,
                              std::vector<CFGNode*>& nodes) {
+  assert(expr && "Null expression");
+  if (curNode == nullptr) {
+    std::cerr << "constructCFG called with curNode == null\n";
+    return nullptr;
+  }
   if (curNode == &deadBranch) {
     std::cerr << "Cannot construct CFG to the dead node. Inst:\n";
     expr->dump();
@@ -305,16 +311,18 @@ static CFGNode* constructCFG(Expression* expr, CFGNode* curNode,
         branches[blockName] = blockEnd;
 
         for (Expression* ex : block->list) {
-          if (!curNode) break;
+          assert(ex);
           curNode = constructCFG(ex, curNode, branches, nodes);
+          if (!curNode) return nullptr;
         }
 
         branches.erase(branches.find(blockName));
         return blockEnd;
       } else {
         for (Expression* ex : block->list) {
-          if (!curNode) break;
+          assert(ex);
           curNode = constructCFG(ex, curNode, branches, nodes);
+          if (!curNode) return nullptr;
         }
 
         return curNode;
@@ -344,8 +352,10 @@ static CFGNode* constructCFG(Expression* expr, CFGNode* curNode,
 
       nodeJoin->preds = {nodeThen, nodeElse};
 
+      assert(ifTrue);
       if (!constructCFG(ifTrue, nodeThen, branches, nodes)) return nullptr;
-      if (!constructCFG(ifElse, nodeElse, branches, nodes)) return nullptr;
+      if (ifElse)
+        if (!constructCFG(ifElse, nodeElse, branches, nodes)) return nullptr;
 
       return nodeJoin;
     }
@@ -361,6 +371,7 @@ static CFGNode* constructCFG(Expression* expr, CFGNode* curNode,
       CFGNode* loopNode = splitNode(curNode, nodes);
       branches[loopName] = loopNode;
 
+      assert(body);
       CFGNode* result = constructCFG(body, loopNode, branches, nodes);
 
       branches.erase(branches.find(loopName));
@@ -415,6 +426,7 @@ static CFGNode* constructCFG(Expression* expr, CFGNode* curNode,
       } else {
         std::cerr << "Control-flow beyond if-then-else is not supported in an "
                      "expression (" __FILE__ " : " << __LINE__ << ")\n";
+        loadExp->dump();
         return nullptr;
       }
     }
@@ -426,6 +438,7 @@ static CFGNode* constructCFG(Expression* expr, CFGNode* curNode,
       } else {
         std::cerr << "Control-flow beyond if-then-else is not supported in an "
                      "expression (" __FILE__ " : " << __LINE__ << ")\n";
+        storeExp->dump();
         return nullptr;
       }
     }
@@ -437,6 +450,7 @@ static CFGNode* constructCFG(Expression* expr, CFGNode* curNode,
       } else {
         std::cerr << "Control-flow beyond if-then-else is not supported in an "
                      "expression (" __FILE__ " : " << __LINE__ << ")\n";
+        unaryExp->dump();
         return nullptr;
       }
     }
@@ -448,8 +462,18 @@ static CFGNode* constructCFG(Expression* expr, CFGNode* curNode,
       } else {
         std::cerr << "Control-flow beyond if-then-else is not supported in an "
                      "expression (" __FILE__ " : " << __LINE__ << ")\n";
+        binaryExp->dump();
         return nullptr;
       }
+    }
+    EXPR_CASE(ReturnId) {
+      Return* returnExp = static_cast<Return*>(expr);
+      if (returnExp->value) {
+        std::cerr << "Kernel cannot return a value\n";
+        return nullptr;
+      }
+      curNode->succs = {};
+      return &deadBranch;
     }
     default: {
       std::cerr << "Encountered unhandled expression (" __FILE__ " : "
@@ -460,6 +484,7 @@ static CFGNode* constructCFG(Expression* expr, CFGNode* curNode,
 }
 
 static bool constructCFG(Expression* expr, std::vector<CFGNode*>& nodes) {
+  assert(expr);
   std::map<Name, CFGNode*> branches;
   CFGNode* start = createNode(nodes);
   start->conditional = false;
@@ -470,10 +495,9 @@ static bool constructCFG(Expression* expr, std::vector<CFGNode*>& nodes) {
 }
 
 static bool emitCode(Expression* expr, std::string& output,
-                     std::vector<InferType>& types,
-                     std::string* valName=nullptr,
-                     InferType* resType=nullptr);
-
+    std::vector<InferType>& types,
+    std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays,
+    std::string* valName=nullptr, InferType* resType=nullptr);
 
 // Converts an array access into a form such that the top-level is always an
 // add, with the left being the array and the right being the index. Returns
@@ -481,9 +505,9 @@ static bool emitCode(Expression* expr, std::string& output,
 // Also takes a vector to track memory allocations that should be freed when
 // the produced expressions are no longer needed
 static Binary* normalizeArray(Expression* expr, 
-                              std::vector<InferType>& types,
-                              std::vector<Expression*>& freeWhenDone,
-                              bool topLevel=true) {
+    std::vector<InferType>& types,
+    std::map<Index, std::tuple<Index, Expression*, Expression*>> localArrays,
+    std::vector<Expression*>& freeWhenDone, bool topLevel=true) {
   if (expr->_id == Expression::Id::LocalGetId) {
     Index access = static_cast<LocalGet*>(expr)->index;
     if (isArray(types[access])) {
@@ -498,7 +522,20 @@ static Binary* normalizeArray(Expression* expr,
       freeWhenDone.push_back(constZero); freeWhenDone.push_back(result);
       return result;
     } else {
-      if (topLevel) {
+      auto f = localArrays.find(access);
+      if (f != localArrays.end()) {
+        // Transform into add of the local for access and the associated array
+        LocalGet* array = new LocalGet;
+        array->index = std::get<0>(f->second);
+
+        Binary* result = new Binary;
+        result->op = BinaryOp::AddInt32;
+        result->left = array;
+        result->right = expr;
+
+        freeWhenDone.push_back(array); freeWhenDone.push_back(result);
+        return result;
+      } else if (topLevel) {
         std::cerr << "Array expression based on local-get of non-array value:\n";
         expr->dump();
       }
@@ -527,8 +564,10 @@ static Binary* normalizeArray(Expression* expr,
   Expression* left  = binaryExp->left;
   Expression* right = binaryExp->right;
 
-  Binary* normalizeLeft = normalizeArray(left, types, freeWhenDone, false);
-  Binary* normalizeRight = normalizeArray(right, types, freeWhenDone, false);
+  Binary* normalizeLeft = normalizeArray(left, types, localArrays,
+                                         freeWhenDone, false);
+  Binary* normalizeRight = normalizeArray(right, types, localArrays,
+                                          freeWhenDone, false);
 
   if (normalizeLeft == nullptr && normalizeRight == nullptr) {
     if (topLevel) {
@@ -575,36 +614,72 @@ static Binary* normalizeArray(Expression* expr,
 }
 
 static bool emitArray(Expression* expr, std::string& output,
-                      std::vector<InferType>& types,
-                      std::string& idxName, std::string& arrayName,
-                      InferType& elemType) {
+    std::vector<InferType>& types,
+    std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays,
+    std::string& idxName, std::string& arrayName, InferType& elemType) {
+
+  Index arrayIndex;
+  std::string indexName; InferType indexType;
+  bool analyzed = false;
+
+  if (expr->_id == Expression::Id::LocalSetId) {
+    LocalSet* localSet = static_cast<LocalSet*>(expr);
+    assert(localSet->isTee() && "emitArray() has non-tee local set");
+    auto f = localArrays.find(localSet->index);
+    if (f != localArrays.end()) {
+      // Emit code for local.set(index, expr)
+      LocalSet indexSet;
+      indexSet.index = localSet->index;
+      indexSet.value = std::get<2>(f->second);
+
+      if (!emitCode(&indexSet, output, types, localArrays))
+        return false;
+      arrayIndex = std::get<0>(f->second);
+      indexName = "local" + std::to_string(localSet->index);
+      indexType = InferType::u32;
+      analyzed = true;
+    }
+  } else if (expr->_id == Expression::Id::LocalGetId) {
+    LocalGet* localGet = static_cast<LocalGet*>(expr);
+    auto f = localArrays.find(localGet->index);
+    if (f != localArrays.end()) {
+      arrayIndex = std::get<0>(f->second);
+      indexName = "local" + std::to_string(localGet->index);
+      indexType = InferType::u32;
+      analyzed = true;
+    }
+  }
+
+  if (!analyzed) {
+    std::vector<Expression*> freeWhenDone;
+    Binary* normalized = normalizeArray(expr, types, localArrays, freeWhenDone);
+
+    if (!normalized) { return false; }
+
+    assert(normalized->op == BinaryOp::AddInt32
+           && "normalizedArray() should only produce an add");
+
+    Expression* array = normalized->left;
+    Expression* index = normalized->right;
+
+    assert(array->_id == Expression::Id::LocalGetId
+           && "normalizedArray() should only produce local-get for array");
+    arrayIndex = static_cast<LocalGet*>(array)->index;
   
-  std::vector<Expression*> freeWhenDone;
-  Binary* normalized = normalizeArray(expr, types, freeWhenDone);
-
-  if (!normalized) { return false; }
-
-  assert(normalized->op == BinaryOp::AddInt32
-         && "normalizedArray() should only produce an add");
-
-  Expression* array = normalized->left;
-  Expression* index = normalized->right;
-
-  assert(array->_id == Expression::Id::LocalGetId
-         && "normalizedArray() should only produce local-get for array");
-  Index arrayIndex = static_cast<LocalGet*>(array)->index;
+    if (!emitCode(index, output, types, localArrays, &indexName, &indexType))
+      return false;
+    if (indexType == InferType::noType || indexName == "") {
+      std::cerr << "Index expression did not produce a value:\n";
+      index->dump();
+      return false;
+    }
+  
+    for (Expression* ptr : freeWhenDone) delete ptr;
+  }
+  
   assert(isArray(types[arrayIndex])
          && "normalizedArray() produces array of non-array type");
   InferType arrayElemType = getElemType(types[arrayIndex]);
-
-  std::string indexName; InferType indexType;
-  if (!emitCode(index, output, types, &indexName, &indexType))
-    return false;
-  if (indexType == InferType::noType || indexName == "") {
-    std::cerr << "Index expression did not produce a value:\n";
-    index->dump();
-    return false;
-  }
 
   std::string idx = "idx" + std::to_string(uniq());
   output += "let " + idx + " = " + indexName + " / "
@@ -615,7 +690,6 @@ static bool emitArray(Expression* expr, std::string& output,
   idxName = idx;
   elemType = arrayElemType;
 
-  for (Expression* ptr : freeWhenDone) delete ptr;
   return true;
 }
 
@@ -645,8 +719,9 @@ static bool emitArray(Expression* expr, std::string& output,
   GEN_BINARY_OP_ALL_FLOAT_TYPES(OpName, Operator, Type)
 
 static bool emitCode(Expression* expr, std::string& output,
-                     std::vector<InferType>& types,
-                     std::string* valName, InferType* resType) {
+    std::vector<InferType>& types,
+    std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays,
+    std::string* valName, InferType* resType) {
   if (valName) *valName = "";
   if (resType) *resType = InferType::noType;
 
@@ -666,9 +741,20 @@ static bool emitCode(Expression* expr, std::string& output,
     EXPR_CASE(LocalSetId) {
       LocalSet* setExp = static_cast<LocalSet*>(expr);
       Index local = setExp->index;
+
+      auto f = localArrays.find(local);
+      if (f != localArrays.end()) {
+        if (setExp == std::get<1>(f->second)) {
+          LocalSet setIdx;
+          setIdx.index = local;
+          setIdx.value = std::get<2>(f->second);
+          return emitCode(&setIdx, output, types, localArrays);
+        }
+      }
+
       Expression* value = setExp->value;
       std::string valueName; InferType valueType;
-      if (!emitCode(value, output, types, &valueName, &valueType))
+      if (!emitCode(value, output, types, localArrays, &valueName, &valueType))
         return false;
       if (valueType == InferType::noType || valueName == "") {
         std::cerr << "Assignment's value did not produce a value ("
@@ -702,8 +788,8 @@ static bool emitCode(Expression* expr, std::string& output,
       Load* loadExp = static_cast<Load*>(expr);
 
       std::string idxName, arrayName; InferType elemType;
-      if (!emitArray(loadExp->ptr, output, types, idxName, arrayName,
-                     elemType))
+      if (!emitArray(loadExp->ptr, output, types, localArrays, idxName,
+                     arrayName, elemType))
         return false;
 
       std::string tmp = "tmp" + std::to_string(uniq());
@@ -716,12 +802,13 @@ static bool emitCode(Expression* expr, std::string& output,
       Store* storeExp = static_cast<Store*>(expr);
 
       std::string idxName, arrayName; InferType elemType;
-      if (!emitArray(storeExp->ptr, output, types, idxName, arrayName,
-                     elemType))
+      if (!emitArray(storeExp->ptr, output, types, localArrays, idxName,
+                     arrayName, elemType))
         return false;
 
       std::string valueName; InferType valueType;
-      if (!emitCode(storeExp->value, output, types, &valueName, &valueType))
+      if (!emitCode(storeExp->value, output, types, localArrays, &valueName,
+                    &valueType))
         return false;
 
       if (valueType == InferType::noType || valueName == "") {
@@ -730,7 +817,7 @@ static bool emitCode(Expression* expr, std::string& output,
         return false;
       }
 
-      // FIXME: Right-now this is a special-case because compiles sometimes
+      // FIXME: Right-now this is a special-case because compilers sometimes
       // like storing ints into floats, and for WebGPU we have to use a bitcast
       // to achieve this; we should have a better test for whether to cast or
       // bitcast
@@ -801,7 +888,8 @@ static bool emitCode(Expression* expr, std::string& output,
       Unary* unaryExp = static_cast<Unary*>(expr);
 
       std::string valueName; InferType valueType;
-      if (!emitCode(unaryExp->value, output, types, &valueName, &valueType))
+      if (!emitCode(unaryExp->value, output, types, localArrays, &valueName,
+                    &valueType))
         return false;
 
       if (valueType == InferType::noType || valueName == "") {
@@ -833,6 +921,14 @@ static bool emitCode(Expression* expr, std::string& output,
           if (resType) *resType = InferType::f32;
           break;
         }
+        case UnaryOp::EqZInt32: case UnaryOp::EqZInt64: {
+          std::string resName = "tmp" + std::to_string(uniq());
+          output += "let " + resName + " : bool = " + valueName + " == "
+                  + typeToWebGPU(valueType) + "(0);\n";
+          if (valName) *valName = resName;
+          if (resType) *resType = InferType::bool_;
+          break;
+        }
         default:
           std::cerr << "Unsupported unary operation encountered (" __FILE__
                        " : " << __LINE__ << "):\n";
@@ -845,9 +941,11 @@ static bool emitCode(Expression* expr, std::string& output,
       Binary* binaryExp = static_cast<Binary*>(expr);
 
       std::string leftName, rightName; InferType leftType, rightType;
-      if (!emitCode(binaryExp->left, output, types, &leftName, &leftType))
+      if (!emitCode(binaryExp->left, output, types, localArrays, &leftName,
+                    &leftType))
         return false;
-      if (!emitCode(binaryExp->right, output, types, &rightName, &rightType))
+      if (!emitCode(binaryExp->right, output, types, localArrays, &rightName,
+                    &rightType))
         return false;
 
       if (leftName == "" || leftType == InferType::noType || rightName == ""
@@ -865,7 +963,14 @@ static bool emitCode(Expression* expr, std::string& output,
         opType = rightType;
       else if (rightType == InferType::n32 || rightType == InferType::n64)
         opType = leftType;
-      else {
+      else if ((typeForEquality(leftType) == InferType::i32
+                || typeForEquality(rightType) == InferType::i32)
+            && (typeForEquality(leftType) == InferType::u32
+                || typeForEquality(rightType) == InferType::u32)) {
+        // TODO: Be more careful about this, this may be alright for some but
+        // not all operations
+        opType = InferType::i32;
+      } else {
         std::cerr << "Type mistach in binary expression (" __FILE__ " : "
                   << __LINE__ << ")\n";
         std::cerr << "Left " << typeToWebGPU(leftType) << ", Right "
@@ -914,11 +1019,14 @@ static bool emitCode(Expression* expr, std::string& output,
 
       std::string condName, trueName, falseName;
       InferType condType, trueType, falseType;
-      if (!emitCode(selectExp->condition, output, types, &condName, &condType))
+      if (!emitCode(selectExp->condition, output, types, localArrays,
+                    &condName, &condType))
         return false;
-      if (!emitCode(selectExp->ifTrue, output, types, &trueName, &trueType))
+      if (!emitCode(selectExp->ifTrue, output, types, localArrays,
+                    &trueName, &trueType))
         return false;
-      if (!emitCode(selectExp->ifFalse, output, types, &falseName, &falseType))
+      if (!emitCode(selectExp->ifFalse, output, types, localArrays,
+                    &falseName, &falseType))
         return false;
 
       if (condName == ""  || condType == InferType::noType
@@ -965,9 +1073,10 @@ static bool emitCode(Expression* expr, std::string& output,
 }
 
 static bool emitCode(CFGNode const& node, std::string& output,
-                     std::vector<InferType>& types) {
+    std::vector<InferType>& types,
+    std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays) {
   for (Expression* exp : node.body) {
-    if (!emitCode(exp, output, types)) return false;
+    if (!emitCode(exp, output, types, localArrays)) return false;
   }
   return true;
 }
@@ -1172,26 +1281,33 @@ static bool emitControlFlow(CFGNode* start,
     std::map<CFGNode*, std::pair<CFGNode*, std::set<CFGNode*>>>& loops,
     std::map<CFGNode*, CFGNode*>& ifThenElse,
     std::string& output, std::vector<std::string>& blockCode,
-    std::vector<InferType>& types, CFGNode* curLoop=nullptr);
+    std::vector<InferType>& types,
+    std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays,
+    CFGNode* curLoop=nullptr);
 
 static bool emitIfThenElse(CFGNode* split, std::string condName,
     std::vector<std::pair<std::set<CFGNode*>, std::set<CFGNode*>>>& dominances,
     std::map<CFGNode*, std::pair<CFGNode*, std::set<CFGNode*>>>& loops,
     std::map<CFGNode*, CFGNode*>& ifThenElse,
     std::string& output, std::vector<std::string>& blockCode,
-    std::vector<InferType>& types, CFGNode* curLoop) {
+    std::vector<InferType>& types,
+    std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays,
+    CFGNode* curLoop) {
+
   CFGNode* join = ifThenElse[split];
 
   output += "if (bool(" + condName + ")) {\n";
   if (!emitControlFlow(split->succs[0], dominances, loops, ifThenElse,
-                       output, blockCode, types, curLoop)) return false;
+                       output, blockCode, types, localArrays, curLoop))
+    return false;
   output += "} else {\n";
   if (!emitControlFlow(split->succs[1], dominances, loops, ifThenElse,
-                       output, blockCode, types, curLoop)) return false;
+                       output, blockCode, types, localArrays, curLoop))
+    return false;
   output += "}\n";
 
   return emitControlFlow(join, dominances, loops, ifThenElse, output,
-                         blockCode, types, curLoop);
+                         blockCode, types, localArrays, curLoop);
 }
 
 static bool emitNonIfThenElse(CFGNode* split, std::string condName,
@@ -1199,7 +1315,9 @@ static bool emitNonIfThenElse(CFGNode* split, std::string condName,
     std::map<CFGNode*, std::pair<CFGNode*, std::set<CFGNode*>>>& loops,
     std::map<CFGNode*, CFGNode*>& ifThenElse,
     std::string& output, std::vector<std::string>& blockCode,
-    std::vector<InferType>& types, CFGNode* curLoop) {
+    std::vector<InferType>& types,
+    std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays,
+    CFGNode* curLoop) {
   output += "if (bool(" + condName + ")) {\n";
 
   CFGNode* loopExit = curLoop ? loops[curLoop].first : nullptr;
@@ -1216,7 +1334,8 @@ static bool emitNonIfThenElse(CFGNode* split, std::string condName,
       // If the split dominates the node beneath it, code-gen that node into
       // the conditional
       if (!emitControlFlow(succ0, dominances, loops, ifThenElse, output,
-                           blockCode, types, curLoop)) return false;
+                           blockCode, types, localArrays, curLoop))
+        return false;
     } else {
       // Must be falling out of a containing if-then-else
     }
@@ -1234,7 +1353,8 @@ static bool emitNonIfThenElse(CFGNode* split, std::string condName,
       output += "break;\n";
     } else if (domsSucc1.find(split) != domsSucc1.end()) {
       if (!emitControlFlow(succ1, dominances, loops, ifThenElse, output,
-                           blockCode, types, curLoop)) return false;
+                           blockCode, types, localArrays, curLoop))
+        return false;
     } else {
       // Must be falling out of a containing if-then-else
     }
@@ -1250,7 +1370,9 @@ static bool emitControlFlow(CFGNode* start,
     std::map<CFGNode*, std::pair<CFGNode*, std::set<CFGNode*>>>& loops,
     std::map<CFGNode*, CFGNode*>& ifThenElse,
     std::string& output, std::vector<std::string>& blockCode,
-    std::vector<InferType>& types, CFGNode* curLoop) {
+    std::vector<InferType>& types,
+    std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays,
+    CFGNode* curLoop) {
   
   auto fLoop = loops.find(start);
   if (fLoop != loops.end()) {
@@ -1270,12 +1392,14 @@ static bool emitControlFlow(CFGNode* start,
       } else {
         if (start->succs[0] == nullptr) output += "return;\n";
         else if (!emitControlFlow(start->succs[0], dominances, loops,
-                                  ifThenElse, output, blockCode, types, start))
+                                  ifThenElse, output, blockCode, types,
+                                  localArrays, start))
                                     return false;
       }
     } else {
       std::string condName; InferType condType;
-      if (!emitCode(start->cond, output, types, &condName, &condType))
+      if (!emitCode(start->cond, output, types, localArrays, &condName,
+                    &condType))
         return false;
       if (condType == InferType::noType || condName == "") {
         std::cerr << "Condition did not produce a value (" __FILE__ " : "
@@ -1286,16 +1410,18 @@ static bool emitControlFlow(CFGNode* start,
       auto fIf = ifThenElse.find(start);
       if (fIf != ifThenElse.end()) {
         if (!emitIfThenElse(start, condName, dominances, loops, ifThenElse,
-                            output, blockCode, types, start)) return false;
+                            output, blockCode, types, localArrays, start))
+          return false;
       } else {
         if (!emitNonIfThenElse(start, condName, dominances, loops, ifThenElse,
-                               output, blockCode, types, start)) return false;
+                               output, blockCode, types, localArrays, start))
+          return false;
       }
     }
 
     output += "}\n";
     return emitControlFlow(exit, dominances, loops, ifThenElse, output,
-                           blockCode, types, start);
+                           blockCode, types, localArrays, start);
   } else {
     output += blockCode[start->index];
 
@@ -1308,14 +1434,15 @@ static bool emitControlFlow(CFGNode* start,
         else if (curLoop && succ == loops[curLoop].first) output += "break;\n";
         else if (succDoms.find(start) != succDoms.end()) {
           return emitControlFlow(succ, dominances, loops, ifThenElse, output,
-                                 blockCode, types, curLoop);
+                                 blockCode, types, localArrays, curLoop);
         } else {
           // Ignore, must be exiting an if-then-else
         }
       }
     } else {
       std::string condName; InferType condType;
-      if (!emitCode(start->cond, output, types, &condName, &condType))
+      if (!emitCode(start->cond, output, types, localArrays, &condName,
+                    &condType))
         return false;
       if (condType == InferType::noType || condName == "") {
         std::cerr << "Condition did not produce a value (" __FILE__ " : "
@@ -1326,11 +1453,11 @@ static bool emitControlFlow(CFGNode* start,
       auto fIf = ifThenElse.find(start);
       if (fIf != ifThenElse.end()) {
         return emitIfThenElse(start, condName, dominances, loops, ifThenElse,
-                              output, blockCode, types, curLoop);
+                              output, blockCode, types, localArrays, curLoop);
       } else {
         return emitNonIfThenElse(start, condName, dominances, loops,
                                  ifThenElse, output, blockCode, types,
-                                 curLoop);
+                                 localArrays, curLoop);
       }
     }
   }
@@ -1339,7 +1466,8 @@ static bool emitControlFlow(CFGNode* start,
 }
 
 static bool codeGen(Expression* expr, std::vector<InferType>& types,
-                    std::string& output) {
+    std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays,
+    std::string& output) {
   std::vector<CFGNode*> cfg;
   if (!constructCFG(expr, cfg)) return false;
 
@@ -1349,7 +1477,7 @@ static bool codeGen(Expression* expr, std::vector<InferType>& types,
   std::vector<std::string> blockCode;
   for (CFGNode* node : cfg) {
     std::string block;
-    if (!emitCode(*node, block, types)) return false;
+    if (!emitCode(*node, block, types, localArrays)) return false;
     blockCode.push_back(block);
     if (node->succs[0] == nullptr) {
       if (endNode) {
@@ -1378,10 +1506,118 @@ static bool codeGen(Expression* expr, std::vector<InferType>& types,
   if (!computeIfThenElse(cfg, dominances, loops, ifThenElse)) return false;
 
   if (!emitControlFlow(startNode, dominances, loops, ifThenElse, output,
-                       blockCode, types)) return false;
+                       blockCode, types, localArrays)) return false;
 
   for (CFGNode* node : cfg) delete node;
   return true;
+}
+
+static void findLocalSets(Expression* expr, std::list<LocalSet*>& sets) {
+  switch (expr->_id) {
+    EXPR_CASE(BlockId) {
+      Block* block = static_cast<Block*>(expr);
+      for (Expression* ex : block->list) {
+        findLocalSets(ex, sets);
+      }
+    } break;
+    EXPR_CASE(IfId) {
+      If* ifExp = static_cast<If*>(expr);
+      Expression* cond = ifExp->condition;
+      Expression* ifTrue = ifExp->ifTrue;
+      Expression* ifElse = ifExp->ifFalse;
+
+      findLocalSets(cond, sets);
+      findLocalSets(ifTrue, sets);
+      if (ifElse)
+        findLocalSets(ifTrue, sets);
+    } break;
+    EXPR_CASE(LoopId) {
+      Loop* loopExp = static_cast<Loop*>(expr);
+      Expression* body = loopExp->body;
+      findLocalSets(body, sets);
+    } break;
+    EXPR_CASE(BreakId) {
+      Break* breakExp = static_cast<Break*>(expr);
+      Expression* cond = breakExp->condition;
+
+      if (cond)
+        findLocalSets(cond, sets);
+    } break;
+    EXPR_CASE(LocalGetId)
+    EXPR_CASE(ConstId)
+    EXPR_CASE(NopId) { break; }
+    EXPR_CASE(LocalSetId) {
+      LocalSet* localSet = static_cast<LocalSet*>(expr);
+      findLocalSets(localSet->value, sets);
+      sets.push_back(localSet);
+    } break;
+    EXPR_CASE(LoadId) {
+      Load* loadExp = static_cast<Load*>(expr);
+      findLocalSets(loadExp->ptr, sets);
+    } break;
+    EXPR_CASE(StoreId) {
+      Store* storeExp = static_cast<Store*>(expr);
+      findLocalSets(storeExp->ptr, sets);
+      findLocalSets(storeExp->value, sets);
+    } break;
+    EXPR_CASE(UnaryId) {
+      Unary* unaryExp = static_cast<Unary*>(expr);
+      findLocalSets(unaryExp->value, sets);
+    } break;
+    EXPR_CASE(BinaryId) {
+      Binary* binaryExp = static_cast<Binary*>(expr);
+      findLocalSets(binaryExp->left, sets);
+      findLocalSets(binaryExp->right, sets);
+    } break;
+    EXPR_CASE(ReturnId) { break; }
+    EXPR_CASE(SelectId) {
+      Select* selectExp = static_cast<Select*>(expr);
+      findLocalSets(selectExp->condition, sets);
+      findLocalSets(selectExp->ifTrue, sets);
+      findLocalSets(selectExp->ifFalse, sets);
+    } break;
+    default: {
+      std::cerr << "findLocalArrays() unhandled expression:\n";
+      expr->dump(); abort();
+    }
+  }
+}
+
+static void computeLocalArrays(Expression* expr, std::vector<InferType>& types,
+    std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays,
+    std::vector<Expression*>& freeWhenDone) {
+  std::list<LocalSet*> sets;
+  findLocalSets(expr, sets);
+
+  bool changed;
+
+  do {
+    changed = false;
+    for (auto it = sets.begin(), end = sets.end(); it != end;) {
+      LocalSet* localSet = *it;
+      // Use topLevel = false to avoid printing error messages
+      Binary* normalized = normalizeArray(localSet->value, types, localArrays,
+                                          freeWhenDone, false);
+      if (normalized) {
+        assert(normalized->op == BinaryOp::AddInt32);
+        assert(normalized->left->_id == Expression::Id::LocalGetId);
+        Index arrayIndex = static_cast<LocalGet*>(normalized->left)->index;
+        assert(isArray(types[arrayIndex]));
+
+        auto f = localArrays.find(localSet->index);
+        assert(f == localArrays.end()
+          && "Found multiple assignments to same array local");
+        
+        types[localSet->index] = InferType::u32;
+        localArrays[localSet->index] =
+          std::make_tuple(arrayIndex, localSet, normalized->right);
+        it = sets.erase(it);
+        changed = true;
+      } else {
+        ++it;
+      }
+    }
+  } while (changed);
 }
 
 static bool translateFunction(
@@ -1460,8 +1696,16 @@ static bool translateFunction(
     }
   }
 
+  // Tuple is the array's index, the index of the set involving the array, and
+  // the index computation to use at that location
+  std::map<Index, std::tuple<Index, Expression*, Expression*>> localArrays;
+  std::vector<Expression*> freeWhenDone;
+  computeLocalArrays(func->body, variableTypes, localArrays, freeWhenDone);
+
   std::string body;
-  if (codeGen(func->body, variableTypes, body)) {
+  if (codeGen(func->body, variableTypes, localArrays, body)) {
+    for (Expression* e : freeWhenDone) delete e;
+
     std::string typeDecls, bindDecls, signature, argInits, footer;
     std::string scalarFields;
     int numBinds = 0;
