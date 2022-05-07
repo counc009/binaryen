@@ -124,7 +124,7 @@ static std::string typeToWebGPU(InferType ty) {
     case InferType::i64_ptr: return "array<i64>";
     case InferType::u64_ptr: return "array<u64>";
     case InferType::f32_ptr: return "array<f32>";
-    case InferType::f64_ptr: { std::cerr << "Firefox doesn't currently support f64"; exit(1); } //return "array<f64>";
+    case InferType::f64_ptr: { std::cerr << "Firefox doesn't currently support f64"; abort(); } //return "array<f64>";
     case InferType::x_idx: return "u32";
     case InferType::y_idx: return "u32";
     case InferType::z_idx: return "u32";
@@ -238,6 +238,10 @@ CFGNode* splitNode(CFGNode* node, std::vector<CFGNode*>& nodes) {
   node->cond = nullptr;
   node->succs = {newNode};
 
+  for (CFGNode* n : newNode->succs) {
+    *std::find(n->preds.begin(), n->preds.end(), node) = newNode;
+  }
+
   return newNode;
 }
 
@@ -348,7 +352,7 @@ static CFGNode* constructCFG(Expression* expr, CFGNode* curNode,
 
       nodeElse->conditional = false;
       nodeElse->succs = {nodeJoin};
-      nodeThen->preds = {curNode};
+      nodeElse->preds = {curNode};
 
       nodeJoin->preds = {nodeThen, nodeElse};
 
@@ -398,6 +402,11 @@ static CFGNode* constructCFG(Expression* expr, CFGNode* curNode,
         // Unconditional Branch
         curNode->conditional = false;
         curNode->cond = nullptr;
+        for (CFGNode* n : curNode->succs) {
+          if (n) {
+            n->preds.erase(std::find(n->preds.begin(), n->preds.end(), curNode));
+          }
+        }
         curNode->succs = {branchTo};
         branchTo->preds.push_back(curNode);
         return &deadBranch;
@@ -472,7 +481,12 @@ static CFGNode* constructCFG(Expression* expr, CFGNode* curNode,
         std::cerr << "Kernel cannot return a value\n";
         return nullptr;
       }
-      curNode->succs = {};
+      for (CFGNode* n : curNode->succs) {
+        if (n) {
+          n->preds.erase(std::find(n->preds.begin(), n->preds.end(), curNode));
+        }
+      }
+      curNode->succs = {nullptr};
       return &deadBranch;
     }
     default: {
@@ -613,7 +627,7 @@ static Binary* normalizeArray(Expression* expr,
   }
 }
 
-static bool emitArray(Expression* expr, std::string& output,
+static bool emitArray(Expression* expr, uint64_t offset, std::string& output,
     std::vector<InferType>& types,
     std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays,
     std::string& idxName, std::string& arrayName, InferType& elemType) {
@@ -682,7 +696,9 @@ static bool emitArray(Expression* expr, std::string& output,
   InferType arrayElemType = getElemType(types[arrayIndex]);
 
   std::string idx = "idx" + std::to_string(uniq());
-  output += "let " + idx + " = " + indexName + " / "
+  output += "let " + idx + " = (" + indexName + " + "
+          + typeToWebGPU(indexType) + "("
+          + std::to_string(offset) + ")) / "
           + typeToWebGPU(indexType) + "("
           + std::to_string(getBytes(arrayElemType)) + ");\n";
 
@@ -788,8 +804,9 @@ static bool emitCode(Expression* expr, std::string& output,
       Load* loadExp = static_cast<Load*>(expr);
 
       std::string idxName, arrayName; InferType elemType;
-      if (!emitArray(loadExp->ptr, output, types, localArrays, idxName,
-                     arrayName, elemType))
+
+      if (!emitArray(loadExp->ptr, loadExp->offset.addr, output, types,
+                     localArrays, idxName, arrayName, elemType))
         return false;
 
       std::string tmp = "tmp" + std::to_string(uniq());
@@ -800,10 +817,11 @@ static bool emitCode(Expression* expr, std::string& output,
     }
     EXPR_CASE(StoreId) {
       Store* storeExp = static_cast<Store*>(expr);
+      assert(storeExp->offset.addr == 0 && "Load at non-zero offset");
 
       std::string idxName, arrayName; InferType elemType;
-      if (!emitArray(storeExp->ptr, output, types, localArrays, idxName,
-                     arrayName, elemType))
+      if (!emitArray(storeExp->ptr, storeExp->offset.addr, output, types,
+                     localArrays, idxName, arrayName, elemType))
         return false;
 
       std::string valueName; InferType valueType;
@@ -900,18 +918,28 @@ static bool emitCode(Expression* expr, std::string& output,
 
       //std::string tmp = "tmp" + std::to_string(uniq());
       switch (unaryExp->op) {
-        case UnaryOp::ConvertUInt32ToFloat32: {
+        case UnaryOp::ConvertUInt32ToFloat32: 
+        case UnaryOp::ConvertSInt32ToFloat32: {
           std::string resName = "tmp" + std::to_string(uniq());
           output += "let " + resName + " : f32 = f32(" + valueName + ");\n";
           if (valName) *valName = resName;
           if (resType) *resType = InferType::f32;
           break;
         }
-        case UnaryOp::ConvertUInt32ToFloat64: {
+        case UnaryOp::ConvertUInt32ToFloat64:
+        case UnaryOp::ConvertSInt32ToFloat64: {
           std::string resName = "tmp" + std::to_string(uniq());
           output += "let " + resName + " : f32 = f32(" + valueName + ");\n"; // FIXME (f64)
           if (valName) *valName = resName;
           if (resType) *resType = InferType::f64;
+          break;
+        }
+        case UnaryOp::TruncSFloat32ToInt32:
+        case UnaryOp::TruncSFloat64ToInt32: {
+          std::string resName = "tmp" + std::to_string(uniq());
+          output += "let " + resName + " : i32 = i32(" + valueName + ");\n";
+          if (valName) *valName = resName;
+          if (resType) *resType = InferType::i32;
           break;
         }
         case UnaryOp::DemoteFloat64: {
@@ -927,6 +955,22 @@ static bool emitCode(Expression* expr, std::string& output,
                   + typeToWebGPU(valueType) + "(0);\n";
           if (valName) *valName = resName;
           if (resType) *resType = InferType::bool_;
+          break;
+        }
+        case UnaryOp::AbsFloat32: case UnaryOp::AbsFloat64: {
+          std::string resName = "temp" + std::to_string(uniq());
+          output += "let " + resName + " : " + typeToWebGPU(valueType)
+                  + " = abs(" + valueName + ");\n";
+          if (valName) *valName = resName;
+          if (resType) *resType = valueType;
+          break;
+        }
+        case UnaryOp::SqrtFloat32: case UnaryOp::SqrtFloat64: {
+          std::string resName = "temp" + std::to_string(uniq());
+          output += "let " + resName + " : " + typeToWebGPU(valueType)
+                  + " = sqrt(" + valueName + ");\n";
+          if (valName) *valName = resName;
+          if (resType) *resType = valueType;
           break;
         }
         default:
@@ -1019,14 +1063,14 @@ static bool emitCode(Expression* expr, std::string& output,
 
       std::string condName, trueName, falseName;
       InferType condType, trueType, falseType;
-      if (!emitCode(selectExp->condition, output, types, localArrays,
-                    &condName, &condType))
-        return false;
       if (!emitCode(selectExp->ifTrue, output, types, localArrays,
                     &trueName, &trueType))
         return false;
       if (!emitCode(selectExp->ifFalse, output, types, localArrays,
                     &falseName, &falseType))
+        return false;
+      if (!emitCode(selectExp->condition, output, types, localArrays,
+                    &condName, &condType))
         return false;
 
       if (condName == ""  || condType == InferType::noType
@@ -1045,7 +1089,13 @@ static bool emitCode(Expression* expr, std::string& output,
         opType = falseType;
       else if (falseType == InferType::n32 || falseType == InferType::n64)
         opType = trueType;
-      else {
+      else if ((typeForEquality(trueType) == InferType::i32
+                || typeForEquality(falseType) == InferType::i32)
+            && (typeForEquality(trueType) == InferType::u32
+                || typeForEquality(falseType) == InferType::u32)) {
+        // TODO: Be more careful about this
+        opType = InferType::i32;
+      } else {
         std::cerr << "Type mismatch in select (" __FILE__ " : "
                   << __LINE__ << ")\n";
         std::cerr << "True value " << typeToWebGPU(trueType) << ", False Value "
@@ -1221,7 +1271,7 @@ static bool computeIfThenElse(std::vector<CFGNode*>& cfg,
       CFGNode* succ1 = node->succs[1];
       if (succ1 == nullptr) continue;
       std::set<CFGNode*>& domsSucc1 = dominances[succ1->index].first;
-  
+
       // If the node properly dominates both of its successors
       if (node != succ0 && domsSucc0.find(node) != domsSucc0.end()
        && node != succ1 && domsSucc1.find(node) != domsSucc1.end()) {
@@ -1250,7 +1300,7 @@ static bool computeIfThenElse(std::vector<CFGNode*>& cfg,
             continue;
           } else if (postDomsCand.find(join) != postDomsCand.end()) {
             // current join point post-dominates cand, use cand as new join
-            join = node;
+            join = cand;
           } else {
             std::cerr << "In computing if-then-else, two potential join "
                          "points did not have a post-dominance relation ("
@@ -1293,17 +1343,18 @@ static bool emitIfThenElse(CFGNode* split, std::string condName,
     std::vector<InferType>& types,
     std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays,
     CFGNode* curLoop) {
-
   CFGNode* join = ifThenElse[split];
 
   output += "if (bool(" + condName + ")) {\n";
-  if (!emitControlFlow(split->succs[0], dominances, loops, ifThenElse,
-                       output, blockCode, types, localArrays, curLoop))
-    return false;
+  if (split->succs[0] != join)
+    if (!emitControlFlow(split->succs[0], dominances, loops, ifThenElse,
+                         output, blockCode, types, localArrays, curLoop))
+      return false;
   output += "} else {\n";
-  if (!emitControlFlow(split->succs[1], dominances, loops, ifThenElse,
-                       output, blockCode, types, localArrays, curLoop))
-    return false;
+  if (split->succs[1] != join) 
+    if (!emitControlFlow(split->succs[1], dominances, loops, ifThenElse,
+                         output, blockCode, types, localArrays, curLoop))
+      return false;
   output += "}\n";
 
   return emitControlFlow(join, dominances, loops, ifThenElse, output,
@@ -1373,7 +1424,6 @@ static bool emitControlFlow(CFGNode* start,
     std::vector<InferType>& types,
     std::map<Index, std::tuple<Index, Expression*, Expression*>>& localArrays,
     CFGNode* curLoop) {
-  
   auto fLoop = loops.find(start);
   if (fLoop != loops.end()) {
     CFGNode* exit = fLoop->second.first;
@@ -1472,7 +1522,7 @@ static bool codeGen(Expression* expr, std::vector<InferType>& types,
   if (!constructCFG(expr, cfg)) return false;
 
   CFGNode* startNode = cfg[0];
-  CFGNode* endNode = nullptr;
+  std::vector<CFGNode*> endNodes;
 
   std::vector<std::string> blockCode;
   for (CFGNode* node : cfg) {
@@ -1480,17 +1530,27 @@ static bool codeGen(Expression* expr, std::vector<InferType>& types,
     if (!emitCode(*node, block, types, localArrays)) return false;
     blockCode.push_back(block);
     if (node->succs[0] == nullptr) {
-      if (endNode) {
-        std::cerr << "Found multiple end nodes\n";
-        return false;
-      }
-      endNode = node;
+      endNodes.push_back(node);
     }
   }
 
-  if (!endNode) {
-    std::cerr << "Found not end node\n";
+  if (endNodes.empty()) {
+    std::cerr << "Found no end node\n";
     return false;
+  }
+
+  CFGNode* end;
+  if (endNodes.size() == 1) {
+    end = endNodes[0];
+  } else {
+    std::cerr << "Found multiple exit nodes, adding a unified exit node\n";
+    end = createNode(cfg);
+    end->succs = {nullptr};
+    
+    for (CFGNode* n : endNodes) {
+      n->succs[0] = end;
+      end->preds.push_back(n);
+    }
   }
 
   std::vector<std::pair<std::set<CFGNode*>, std::set<CFGNode*>>>
@@ -1500,7 +1560,7 @@ static bool codeGen(Expression* expr, std::vector<InferType>& types,
   std::map<CFGNode*, std::pair<CFGNode*, std::set<CFGNode*>>> loops;
   std::map<CFGNode*, CFGNode*> ifThenElse;
 
-  computeDominances(cfg, startNode, endNode, dominances);
+  computeDominances(cfg, startNode, end, dominances);
   if (!computeBackEdges(cfg, dominances, backEdges)) return false;
   if (!computeLoops(backEdges, loops)) return false;
   if (!computeIfThenElse(cfg, dominances, loops, ifThenElse)) return false;
